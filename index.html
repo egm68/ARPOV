@@ -1,0 +1,681 @@
+<!-- Needs webserver to run correctly -->
+<!-- see https://threejs.org/docs/#manual/en/introduction/Installation for setup instructions (Option 1: Install with NPM and a build tool) -->
+<!-- run: npx vite -->
+<!-- open: http://localhost:5173/ -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>WebGL/Three.js Image Compositing</title>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="//code.jquery.com/ui/1.11.4/themes/smoothness/jquery-ui.css">
+    <script src="//code.jquery.com/jquery-1.10.2.js"></script>
+    <script src="//code.jquery.com/ui/1.11.4/jquery-ui.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.11.1/jquery.min.js"></script>
+    <script src="js/main.js"></script>
+    <script src="https://docs.opencv.org/4.1.1/opencv.js"></script>
+    <!--<script src="js/opencv.js"></script>-->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.147.0/three.min.js"></script> 
+    <script id="fullscreen-vert" type="x-shader/x-vertex">
+        varying vec2 vUv;
+
+        void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 1.0, 1.0);
+        }
+    </script>
+    <script id="fullscreen-frag" type="x-shader/x-fragment">
+        varying vec2 vUv;
+        uniform sampler2D tex;
+
+        void main() {
+            vec3 diffuse = texture2D( tex, vUv ).rgb;
+            gl_FragColor.rgb = diffuse;
+            gl_FragColor.a = 1.0;
+        }
+    </script>
+    <script id="blending-vert" type="x-shader/x-vertex">
+        varying vec2 vUv;
+
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    </script>
+    <script id="blending-frag" type="x-shader/x-fragment">
+        varying vec2 vUv;
+        uniform sampler2D tex;
+        uniform sampler2D bgTex;
+        uniform float resX;
+        uniform float resY;
+        uniform float alpha;
+        uniform int highlight;
+        uniform vec3 borderColor;
+
+        void main() {
+            // get color of current image
+            vec3 color = texture2D( tex, vUv ).rgb;
+            // texture coordinates of previous frame
+            vec2 st = gl_FragCoord.xy / vec2(resX, resY);
+            // get background color from texture (previous render target)
+            vec3 bgColor = texture2D( bgTex, st).rgb; 
+
+            // this is a bit hacky (we assume that the background color is white)
+            if( bgColor.x > 0.99 && bgColor.y > 0.99 && bgColor.z > 0.99 )
+                // if the previous pixel has the background color: 
+                //    render on top
+                gl_FragColor.rgb = color;
+            else
+                // if the previous pixel does not have the background color: 
+                //    blend with previous color
+                gl_FragColor.rgb = bgColor * (1.0 - alpha) + color * alpha;
+
+            // highlight pixels on the border of the image
+            if (highlight == 1) {
+                float borderX = 0.005;
+                float borderY = (resX / resY) * borderX;
+                float testX = 0.1;
+                if (bgColor == borderColor)
+                    gl_FragColor.rgb = borderColor;
+                // check if pixel is on the border
+                if( vUv.s < borderX || vUv.s > 1.0 - borderX || vUv.t < borderY || vUv.t > 1.0 - borderY )
+                    gl_FragColor.rgb = borderColor;
+            }
+            
+            gl_FragColor.a = 1.0;
+        }
+    </script>
+    <script id="blending-frag-obj" type="x-shader/x-fragment">
+        varying vec2 vUv;
+        uniform sampler2D tex;
+        uniform sampler2D bgTex;
+        uniform float resX;
+        uniform float resY;
+        uniform float alpha;
+        uniform int highlight;
+        uniform bool boundingBoxes;
+        uniform bool centerDots;
+        uniform bool arrows;
+        uniform bool none;
+        uniform vec3 borderColor;
+        uniform vec3 color_array[14];
+        uniform vec4 obj_array[700]; 
+        uniform vec4 arrows_array[700];
+        uniform int obj_array_length;
+        uniform int arrows_array_length;
+
+
+        float circle(in vec2 _st, in vec2 pos, in float _radius){
+            vec2 dist = _st-pos;
+            dist[1] = dist[1]*0.6;
+            return 1.-smoothstep(_radius-(_radius*0.01),
+                                 _radius+(_radius*0.01),
+                                 dot(dist,dist)*4.0);
+        }
+
+        float line(vec2 p1, vec2 p2, float width, vec2 uv){
+            float dist = distance(p1, p2); // Distance between points
+            float dist_uv = distance(p1, uv); // Distance from p1 to current pixel
+
+            // If point is on line, according to dist, it should match current UV
+            // Ideally the '0.001' should be SCREEN_PIXEL_SIZE.x, but we can't use that outside of the fragment function.
+            return 1.0 - floor(1.0 - (0.001 * width) + distance (mix(p1, p2, clamp(dist_uv / dist, 0.0, 1.0)),  uv));
+        }
+
+        //Computes the signed distance from a line 
+        float line_distance(vec2 p, vec2 p1, vec2 p2){ 
+            vec2 center = (p1 + p2) * 0.5; 
+            float len = length(p2 - p1);  
+            vec2 dir = (p2 - p1) / len; 
+            vec2 rel_p = p - center; 
+            return dot(rel_p, vec2(dir.y, -dir.x)); 
+        }
+
+        //Computes the signed distance from a line segment 
+        float segment_distance(vec2 p, vec2 p1, vec2 p2){ 
+            vec2 center = (p1 + p2) * 0.5; 
+            float len = length(p2 - p1); 
+            vec2 dir = (p2 - p1) / len; 
+            vec2 rel_p = p - center; 
+            float dist1 = abs(dot(rel_p, vec2(dir.y,-dir.x)));  
+            float dist2 = abs(dot(rel_p, dir)) - 0.5*len; 
+            return max(dist1, dist2); 
+        }
+
+        float arrow_angle(vec2 texcoord, float body, float head, float height, float linewidth, float antialias) { 
+            float d; 
+            float w = linewidth / 2.0 + antialias; 
+            vec2 start = -vec2(body/2.0,0.0); 
+            vec2 end = +vec2(body/2.0,0.0); 
+
+            //Arrowtip(beyondsegmentend) 
+            if(texcoord.x > body/2.0){ 
+                //Head:2segments 
+                float d1=line_distance(texcoord, end,end-head*vec2(+1.0,-height)); 
+                float d2=line_distance(texcoord, end-head*vec2(+1.0,+height),end); 
+                
+                //Body:1segment 
+                float d3 = end.x-texcoord.x; 
+                d = max(max(d1,d2),d3); 
+            }else{ 
+                //Head:2segments 
+                float d1=segment_distance(texcoord, end-head*vec2(+1.0,-height),end); 
+                float d2=segment_distance(texcoord, end-head*vec2(+1.0,+height),end); 
+                
+                //Body:1segment 
+                float d3 = segment_distance(texcoord, start,end-vec2(linewidth,0.0)); 
+                d = min(min(d1,d2),d3); 
+            } 
+            return d; 
+        }
+
+        float arrow_angle_90(vec2 texcoord, float body,float head, float linewidth,float antialias) { 
+            return arrow_angle(texcoord, body, head, 1.00, linewidth, antialias); 
+        }
+        
+        void main() {
+            // get color of current image
+            vec3 color = texture2D( tex, vUv ).rgb;
+            // texture coordinates of previous frame
+            vec2 st = gl_FragCoord.xy / vec2(resX, resY);
+            // get background color from texture (previous render target)
+            vec3 bgColor = texture2D( bgTex, st).rgb; 
+
+            gl_FragColor.rgb = bgColor;
+
+            // draw object detection
+            if (centerDots == true) {
+
+                for (int i = 0; i < obj_array_length; i = i+2) {
+                    vec2 center = vec2(((obj_array[i].x + obj_array[i+1].x)/2.0), ((obj_array[i].y + obj_array[i+1].y)/2.0));
+
+                    vec3 circle_location = vec3(circle(st, center, 0.00015));
+
+                    if (circle_location.x > 0.001){
+                        gl_FragColor = vec4( color_array[int(obj_array[i].z)], 1.0 );
+                    }
+                }
+            }
+
+            if (boundingBoxes == true){
+                for (int i = 0; i < obj_array_length; i = i+2) {
+                    vec2 pxy = vec2(obj_array[i].x, obj_array[i].y);
+                    vec2 pwy = vec2(obj_array[i+1].x, obj_array[i].y);
+                    vec2 pwh = vec2(obj_array[i+1].x, obj_array[i+1].y);
+                    vec2 pxh = vec2(obj_array[i].x, obj_array[i+1].y);
+
+                    vec3 line1_location = vec3(line(pxy, pwy, 2.0, st));
+                    vec3 line2_location = vec3(line(pwy, pwh, 2.0, st));
+                    vec3 line3_location = vec3(line(pwh, pxh, 2.0, st));
+                    vec3 line4_location = vec3(line(pxh, pxy, 2.0, st));
+
+                    if (line1_location.x > 0.001 || line2_location.x > 0.001 || line3_location.x > 0.001 || line4_location.x > 0.001){
+                        gl_FragColor = vec4( color_array[int(obj_array[i].z)], 1.0 );
+                    }
+
+                }
+            }
+
+            if (arrows == true){
+                float prev_arrow_idx = 0.0;
+                vec2 prev_point = vec2(arrows_array[0].x, arrows_array[0].y);
+                for (int i = 0; i < arrows_array_length; i++) {
+                    if (arrows_array[i].w == prev_arrow_idx){
+                        //draw point
+                        vec2 new_point = vec2(arrows_array[i].x, arrows_array[i].y);
+                        vec3 circle_location = vec3(circle(st, new_point, 0.00015));
+                        if (circle_location.x > 0.001){
+                            gl_FragColor = vec4( color_array[int(arrows_array[i].z)], 1.0 );
+                        }
+
+
+                        //draw arrow 
+                        float dx = new_point.x - prev_point.x;
+                        float dy = new_point.y - prev_point.y;
+                        float v_norm = sqrt(pow(dx, 2.0) + pow(dy, 2.0));
+                        // point on line at distance
+                        float distance = 0.020;
+                        float length = 0.020;
+                        vec2 point_on_line = vec2(new_point.x - distance * dx / v_norm, new_point.y - distance * dy / v_norm);
+                        vec2 point_below = vec2(point_on_line.x - length * -dy / v_norm, point_on_line.y - length * dx / v_norm);
+                        vec2 point_above = vec2(point_on_line.x + length * -dy / v_norm, point_on_line.y + length * dx / v_norm);
+
+                        vec3 line_location1 = vec3(line(prev_point, new_point, 2.0, st));
+                        vec3 line_location2 = vec3(line(new_point, point_below, 2.0, st));
+                        vec3 line_location3 = vec3(line(new_point, point_above, 2.0, st));
+
+                        if (line_location1.x > 0.001 || line_location2.x > 0.001 || line_location3.x > 0.001){
+                            gl_FragColor = vec4( color_array[int(arrows_array[i].z)], 1.0 );
+                        }
+
+
+                        prev_point = new_point;
+                    } 
+                    else if (arrows_array[i].w == 1000.0){
+                        break;
+                    }
+                    else{
+                        prev_arrow_idx = arrows_array[i].w;
+                        vec2 new_point = vec2(arrows_array[i].x, arrows_array[i].y);
+                        vec3 circle_location = vec3(circle(st, new_point, 0.00015));
+                        if (circle_location.x > 0.001){
+                            gl_FragColor = vec4( color_array[int(arrows_array[i].z)], 1.0 );
+                        }
+                        prev_point = new_point;
+                    }
+
+
+                }
+            }
+
+            //gl_FragColor.a = 1.0;
+        }
+    </script>
+    
+</head>
+<body onload="cv['onRuntimeInitialized']=()=>{ main() }">
+    <div class="header">
+        <!--
+        <form action="/action_page.php">
+            <input type="file" id="myFile" name="filename">
+            <input type="submit">
+        </form>
+        -->
+        <h2>ARPOV</h2>
+    </div>
+    <div slider id="slider-distance">
+        <div>
+          <div inverse-left style="width:100%;"></div> <!--70%?-->
+          <div inverse-right style="width:100%;"></div> <!--70%?-->
+          <div range style="left:0%;right:0%;"></div>
+          <span thumb style="left:0%;"></span>
+          <span thumb style="left:100%;"></span>
+          <div sign style="left:0%;">
+            <!--<span id="value">1</span>-->
+          </div>
+          <div sign style="left:100%;">
+            <!--<span id="value">100</span>-->
+          </div>
+        </div>
+        <input type="range" value="1" max="101" min="1" step="1" oninput="
+        this.value=Math.min(this.value,this.parentNode.childNodes[5].value-1);
+        let value = (this.value/parseInt(this.max))*100
+        var children = this.parentNode.childNodes[1].childNodes;
+        children[1].style.width=value+'%';
+        children[5].style.left=value+'%';
+        children[7].style.left=value+'%';children[11].style.left=value+'%';
+        children[11].childNodes[1].innerHTML=this.value;" id="startFrame" name="startFrame"/>
+      
+        <input type="range" value="101" max="101" min="1" step="1" oninput="
+        this.value=Math.max(this.value,this.parentNode.childNodes[3].value-(-1));
+        let value = (this.value/parseInt(this.max))*100
+        var children = this.parentNode.childNodes[1].childNodes;
+        children[3].style.width=(100-value)+'%';
+        children[5].style.right=(100-value)+'%';
+        children[9].style.left=value+'%';children[13].style.left=value+'%';
+        children[13].childNodes[1].innerHTML=this.value;" id="endFrame" name="endFrame"/>
+    </div>
+    <div class="wrapperleft">
+    <video id="videoID" width="570" control="false">
+        <script type="module">
+            //load video file
+            var video_path = "/gmu_scene_001_first_100_resized_mp4.mp4"
+            const video = document.querySelector('#videoID')
+            video.src = video_path;
+            video.currentTime = 0;
+        </script>
+        <source type="video/mp4">
+        Your browser does not support HTML video.
+    </video>
+    <script>
+        const video = document.querySelector('#videoID');
+        var sliderStartFrame = document.getElementById("startFrame");
+        var sliderEndFrame = document.getElementById("endFrame"); 
+
+        sliderStartFrame.oninput = function() {
+            video.currentTime = sliderStartFrame.value / 10;
+        }
+
+        sliderEndFrame.oninput = function() {
+            video.currentTime = sliderEndFrame.value / 10;
+        }
+    </script>
+    <div class="wrapperleftinterior">
+    <h2>Build Panorama</h2>
+    <br>
+    <label for="keypoint-detectors">Keypoint detector:</label>
+    <select name="keypoint-detectors" id="keypoint-detectors">
+        <option value="1" selected="selected">BRISK</option> 
+        <option value="2">ORB</option> 
+        <!--
+        <option value="MSER">MSER</option> 
+        <option value="FastFeatureDetector">FastFeatureDetector</option> 
+        <option value="AgastFeatureDetector">AgastFeatureDetector</option> 
+        <option value="GFTTDetector">GFTTDetector</option>
+        -->
+        <option value="3">KAZE</option> 
+        <option value="4">AKAZE</option> 
+    </select>
+    <br></br>
+    <label for="dropout">Stitch every</label>
+    <input type="text" id="dropout" name="dropout" value="5" placeholder="5">
+    frames
+    </div>
+    <br></br>
+    <br></br>
+    <div class="wrapperleftinterior">
+        <label for="lowes">Lowe's Ratio Test threshold:</label>
+        <input type="text" id="lowes" name="lowes" value="0.7" placeholder="0.7">
+        <div class="help-tip">
+            <p>Lower threshold yields fewer qualifying keypoint matches (and vice versa). Default 0.7. <br />
+                <a href="https://people.eecs.berkeley.edu/~malik/cs294/lowe-ijcv04.pdf">Read Lowe's paper here.</a>
+            </p>
+        </div>
+    </div>
+    <br></br>
+    <br></br>
+    <div class="wrapperleftinterior">
+        <label for="ransac">RANSAC Reprojection threshold:</label>
+        <input type="text" id="ransac" name="ransac" value="3" placeholder="3">
+        <div class="help-tip-rrt">
+            <p>Maximum distance from a point to an epipolar line. Typical range 1-3, default 3.<br />
+                <a href="https://docs.opencv.org/3.4/d9/d0c/group__calib3d.html#ga4abc2ece9fab9398f2e560d53c8c9780">See OpenCV docs for more details.</a>
+            </p>
+        </div>
+    </div>  
+    <br></br>
+    <br></br>
+    <div class="wrapperleftinterior">
+        Apply homography filtering:
+        <label class="switch">
+            <input type="checkbox" id="homographyFilterSwitch">
+            <span class="slider round"></span>
+        </label>
+        <div class="help-tip-ct">
+            <p>Removes outlier frames that get overly distorted or flipped vertically.<br />
+                <a href="#"></a>
+            </p>
+        </div>
+    </div>
+    <br></br>
+    <br></br>
+    <div class="wrapperleftinterior">
+    <div class="slidecontainer">
+        Alpha value:
+        <input type="range" min="0" max="1" step="0.1" value="0.5" id="alpha"><span id="demo"></span>
+    </div>
+    <script>
+        var slider = document.getElementById("alpha");
+        var output = document.getElementById("demo");
+        output.innerHTML = slider.value;
+        
+        slider.oninput = function() {
+          output.innerHTML = this.value;
+        }
+    </script>
+    <br></br>
+    <br></br>
+    <br></br>
+    <button type="button" id="generate-panorama" value="0" onclick="generateNewPanorama()">Generate Panorama</button> <!--add onClick here that recomputes the panorama-->
+    </div>
+    <br></br>
+    <br></br>
+    <br></br>
+    <br></br>
+    <!--
+    <h3>Highlighting Anomalies</h3>
+    <label class="dropdown-option">
+        <input type="checkbox" name="dropdown-group" value="Instances of duplicates" />
+        Instances of duplicates 
+    </label>
+    <label class="dropdown-option">
+        <input type="checkbox" name="dropdown-group" value="Instances of duplicates" />
+        Disappear and return
+    </label>
+    <label class="dropdown-option">
+        <input type="checkbox" name="dropdown-group" value="Instances of duplicates" />
+        Overlapping objects 
+    </label>
+    -->
+    <br></br>
+    </div>
+    <!--
+    <div class="wrapperright">
+        <div class="scrolls">
+            <img src='/panoMosaics_example/0.png' style="width:380px;height:214px;" />
+            <img src='/panoMosaics_example/1.png' style="width:380px;height:214px;" />
+            <img src='/panoMosaics_example/2.png' style="width:380px;height:214px;" />
+        </div>
+    </div>
+    -->
+    <br></br>
+    <br></br>
+    <div class="canvas" id="canvas">
+        <div class="canvas-pano" id="canvas-pano"></div>
+    </div>
+    <div class="wrapperright">
+        <div class="wrapperleftinterior">
+            <h2>Annotations</h2>
+            <div class="slidecontainer">
+                Highlight frame:
+                <input type="range" min="0" max="10" step="1" value="0" id="highlightFrame"><span id="demoframe"></span> 
+            </div>
+            <script>
+                var endFrameIdx = document.getElementById("endFrame").value;
+                var sliderframe = document.getElementById("highlightFrame");
+                sliderframe.max = endFrameIdx - 1
+        
+                var outputframe = document.getElementById("demoframe");
+                outputframe.innerHTML = sliderframe.value;
+                
+                sliderframe.oninput = function() {
+                    outputframe.innerHTML = this.value;
+                }
+            </script>
+            <br></br>
+            <div>
+                Object annotation style:
+                <br></br>
+                <input type="radio" id="none" name="objAnnotation" value="none" checked>
+                <label for="none">None</label>
+                <br></br>
+                <input type="radio" id="boundingBoxes" name="objAnnotation" value="boundingBoxes">
+                <label for="boundingBoxes">Bounding Boxes</label>
+                <br></br>
+                <input type="radio" id="centerDots" name="objAnnotation" value="centerDots">
+                <label for="centerDots">Center Dots</label>
+                <br></br>
+                <input type="radio" id="arrows" name="objAnnotation" value="arrows">
+                <label for="arrows">Arrows</label>
+            </div>
+            <br></br>
+            <div class="slidecontainer">
+                Confidence threshold:
+                <input type="range" min="0" max="1" step="0.05" value="0.5" id="conf"><span id="democonf"></span>
+            <br></br>
+            </div>
+            <script>
+                var sliderconf = document.getElementById("conf");
+                var outputconf = document.getElementById("democonf");
+                outputconf.innerHTML = sliderconf.value;
+                
+                sliderconf.oninput = function() {
+                    outputconf.innerHTML = this.value;
+                    //filter_confidence(this.value, objects_by_frame_arr_frames_being_stitched)
+                }
+            </script>
+            </div>  
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-0"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value='bowl' id="Bowl" onClick="checkboxUpdateFunction()" checked/>
+                        Bowl
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-1"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="coca_cola_glass_bottle" id="Coke" onClick="checkboxUpdateFunction()" checked/>
+                        Coca Cola Glass Bottle
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-2"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value='mug' id="Mug" onClick="checkboxUpdateFunction()" checked/>
+                        Mug
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-3"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="nature_valley_soft_baked_oatmeal_squares_cinnamon_brown_sugar_box" id="OatmealSquares" onClick="checkboxUpdateFunction()" checked/>
+                        Nature Valley Soft Baked Oatmeal Squares Cinnamon Brown Sugar Box
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-4"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="pop_secret_light_butter_popcorn_box" id="Popcorn" onClick="checkboxUpdateFunction()" checked/>
+                        Pop Secret Light Butter Popcorn Box
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-5"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="red_bull_can" id="RedBull" onClick="checkboxUpdateFunction()" checked/>
+                        Red Bull Can
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-6"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="honey_bunches_of_oats_honey_roasted_cereal_box" id="Cereal" onClick="checkboxUpdateFunction()" checked/>
+                        Honey Bunches of Oats Honey Roasted Cereal Box
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-7"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="coffee_mate_french_vanilla_creamer_container" id="Creamer" onClick="checkboxUpdateFunction()" checked/>
+                        Coffee Mate French Vanilla Creamer Container
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-8"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="hunts_tomato_sauce_can" id="TomatoSauce" onClick="checkboxUpdateFunction()" checked/>
+                        Hunts Tomato Sauce Can
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-9"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="mahatma_rice_bag" id="Rice" onClick="checkboxUpdateFunction()" checked/>
+                        Mahatma Rice Bag
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-10"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="nature_valley_sweet_and_salty_nut_almond_box" id="Almonds" onClick="checkboxUpdateFunction()" checked/>
+                        Nature Valley Sweet and Salty Nut Almond Box
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-11"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="palmolive_orange_dish_soap" id="DishSoap" onClick="checkboxUpdateFunction()" checked/>
+                        Palmolive Orange Dish Soap
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-12"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value="pringles_bbq_chips_can" id="Pringles" onClick="checkboxUpdateFunction()" checked/>
+                        Pringles BBQ Chips Can
+                    </label>
+                </div>
+            </div>
+            <div class="wrapperleftinteriorOuter">
+                <div class="obj-key-13"></div>
+                <div class="wrapperleftinteriorCheckbox">
+                    <label class="dropdown-option">
+                        <input type="checkbox" name="dropdown-group" value='salt' id="Salt" onClick="checkboxUpdateFunction()" checked/>
+                        Salt
+                    </label>
+                </div>
+            </div>
+    </div>
+    <script type="module">
+        init_processing()
+        //var jsonDataDETIC = await fetch("/GMU-Scene-1-DETIC-generic-vocab-2-with-extra-objs-mug-bowl-salt-no-nums-first-100.json"); //# frames total: 6901
+        //var total_frames = 100
+        //var jsonDETIC = await jsonDataDETIC.json();
+        //console.log(jsonDETIC)
+        //var obj_data= init_obj_processing_case_study();
+        //console.log(obj_data)
+    </script>
+    <!--   
+    <script type="module" id="stitch">
+        
+        //stuff that only needs to be done once up top
+        let frames_arr = []
+        let total_frames_to_read = 3
+        let file_path = 'panoMosaics_example/'
+        for (let i = 0; i < total_frames_to_read; i++){
+            let src = new Image()
+            src.src = file_path + String(i) + '.png'
+            await new Promise(r => {
+                src.onload = r
+            })
+            src = cv.imread(src)
+            frames_arr.push(src)
+        }
+        var jsonDataDETIC = await fetch("/2023.03.29-17.39.21-detic-image.json"); //# frames total: 6901
+        var total_frames = 6901
+        var jsonDETIC = await jsonDataDETIC.json();
+        var obj_data= init_obj_processing(jsonDETIC, total_frames);
+        add_ticks_to_slider(jsonDETIC, obj_data[1])
+
+        //call pano
+        let panoData = frame_to_tex(frames_arr, file_path)
+        
+        //redo objs
+        let userInputObjs = filter_obj_by_user_input(obj_data, panoData)
+
+        //redo arrows
+        let arrows_arr_padded = filter_arrows_by_user_input(obj_data, userInputObjs[1])
+
+        //render function
+        render(panoData, userInputObjs[0], arrows_arr_padded, obj_data)
+
+    </script>
+    -->
+</body>
+</html>
