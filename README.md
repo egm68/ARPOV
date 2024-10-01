@@ -1,4 +1,4 @@
-[![Paper](https://img.shields.io/badge/read%20the-paper-blueviolet)](https://github.com/egm68/panoramic-mosaics/blob/main/panoMosaics_report.pdf) 
+[![Paper](https://img.shields.io/badge/read%20the-paper-blueviolet)](https://drive.google.com/file/d/1YRTWey_-dwokRPS4khmohgh7nY98Xvta/view?usp=sharing) 
 [![Presentation](https://img.shields.io/badge/watch%20the-presentation-brightgreen)](https://drive.google.com/file/d/1VoTLyiOokUvBWNDL_-HQITL-VaskR55b/view?usp=sharing)
 
 # ARPOV
