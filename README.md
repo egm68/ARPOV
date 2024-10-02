@@ -3,3 +3,6 @@
 
 # ARPOV
 ARPOV is an interactive visual analytics tool for analyzing object detection model outputs tailored to video captured by an AR headset that maximizes user understanding of model performance. It was designed as part of a collaboration between visualization researchers and machine learning and AR experts. 
+
+## Setup
+To use ARPOV on your machine, simply clone this repo, open the folder in the command line, and run the command ``` npx vite``` . 
